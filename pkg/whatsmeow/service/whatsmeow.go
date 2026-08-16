@@ -97,6 +97,8 @@ type whatsmeowService struct {
 	natsProducer       producer_interfaces.Producer
 	loggerWrapper      *logger_wrapper.LoggerManager
 	passkeyCeremony    *ceremony.Store
+	runtimeTokens      map[string]string // instanceID -> token, prevents duplicate runtimes
+	runtimeMu          sync.Mutex        // guards runtimeTokens
 }
 
 type MyClient struct {
@@ -301,9 +303,41 @@ func (w whatsmeowService) ForceUpdateJid(instanceId string, number string) error
 	return nil
 }
 
+// reserveRuntime claims the right to run a client for the given instance.
+// Returns a release function and true if the reservation was acquired,
+// or nil and false if another runtime already holds the reservation.
+func (w *whatsmeowService) reserveRuntime(instanceID string) (func(), bool) {
+	w.runtimeMu.Lock()
+	defer w.runtimeMu.Unlock()
+	if _, held := w.runtimeTokens[instanceID]; held {
+		return nil, false
+	}
+	token := fmt.Sprintf("%s-%d", instanceID, time.Now().UnixNano())
+	w.runtimeTokens[instanceID] = token
+	released := false
+	return func() {
+		w.runtimeMu.Lock()
+		defer w.runtimeMu.Unlock()
+		if !released && w.runtimeTokens[instanceID] == token {
+			delete(w.runtimeTokens, instanceID)
+			released = true
+		}
+	}, true
+}
+
 func (w whatsmeowService) StartClient(cd *ClientData) {
 
 	w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("Starting websocket connection to Whatsapp for user '%s'", cd.Instance.Id)
+
+	// Prevent duplicate runtimes for the same instance. Without this guard,
+	// a QR request or reconnect can spawn a second client that shares the
+	// same killChannel and database row, causing the first to be torn down.
+	release, ok := w.reserveRuntime(cd.Instance.Id)
+	if !ok {
+		w.loggerWrapper.GetLogger(cd.Instance.Id).LogWarn("[%s] Runtime already active, skipping duplicate StartClient", cd.Instance.Id)
+		return
+	}
+	defer release()
 
 	var deviceStore *store.Device
 	var err error
@@ -465,6 +499,9 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 
 	client.EnableAutoReconnect = false
 	client.AutoTrustIdentity = true
+	// When enabled, undecryptable messages are re-requested from the phone
+	// instead of being dropped. Useful for first-contact messages from new leads.
+	client.AutomaticMessageRerequestFromPhone = w.config.RerequestFromPhone
 
 	mycli := &MyClient{
 		service:            &w,
@@ -626,9 +663,10 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 				go mycli.service.SendToGlobalQueues(postMap["event"].(string), values, mycli.userID)
 			}
 
-			// restart client
-			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Restarting client", cd.Instance.Id)
-			w.StartClient(cd)
+			// Do NOT recursively call StartClient here — the runtime
+			// reservation is still held and would block. Reconnection is
+			// handled by the Disconnected event handler or by the caller.
+			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Kill handler cleanup done, not restarting from here", cd.Instance.Id)
 			return
 		default:
 			time.Sleep(1000 * time.Millisecond)
@@ -1819,12 +1857,15 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		doWebhook = true
 		postMap["event"] = "Archive"
 
-		dataMap := postMap["data"].(map[string]interface{})
-		dataMap["JID"] = evt.JID
-		dataMap["Timestamp"] = evt.Timestamp
-		dataMap["Action"] = evt.Action
-		dataMap["FromFullSync"] = evt.FromFullSync
-		postMap["data"] = dataMap
+		// Build data map directly — the previous code asserted
+		// postMap["data"].(map[string]interface{}) which panicked because
+		// postMap["data"] is rawEvt (*events.Archive), not a map.
+		postMap["data"] = map[string]interface{}{
+			"JID":          evt.JID,
+			"Timestamp":    evt.Timestamp,
+			"Action":       evt.Action,
+			"FromFullSync": evt.FromFullSync,
+		}
 
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Chat archived", mycli.userID)
 	case *events.HistorySync:
@@ -2436,25 +2477,28 @@ func (w whatsmeowService) StartInstance(instanceId string) error {
 }
 
 func (w whatsmeowService) ConnectOnStartup(clientName string) {
-	w.loggerWrapper.GetLogger(clientName).LogInfo("Connecting all instances on startup")
+	w.loggerWrapper.GetLogger(clientName).LogInfo("Connecting all paired instances on startup")
 	var instances []*instance_model.Instance
 	var err error
 
+	// Use paired instances (has JID) instead of connected instances.
+	// After a redeploy the Connected flag is stale, but the JID persists
+	// in the auth store — so we restore by JID, not by the transient flag.
 	if clientName != "" {
-		instances, err = w.instanceRepository.GetAllConnectedInstancesByClientName(clientName)
+		instances, err = w.instanceRepository.GetAllPairedInstancesByClientName(clientName)
 		if err != nil {
-			w.loggerWrapper.GetLogger(clientName).LogError("[%s] Error getting all connected instances: %s", clientName, err)
+			w.loggerWrapper.GetLogger(clientName).LogError("[%s] Error getting paired instances: %s", clientName, err)
 			return
 		}
 	} else {
-		instances, err = w.instanceRepository.GetAllConnectedInstances()
+		instances, err = w.instanceRepository.GetAllPairedInstances()
 		if err != nil {
-			w.loggerWrapper.GetLogger(clientName).LogError("[%s] Error getting all connected instances: %s", clientName, err)
+			w.loggerWrapper.GetLogger(clientName).LogError("[%s] Error getting paired instances: %s", clientName, err)
 			return
 		}
 	}
 
-	w.loggerWrapper.GetLogger(clientName).LogInfo("[%s] Found %d connected instances", clientName, len(instances))
+	w.loggerWrapper.GetLogger(clientName).LogInfo("[%s] Found %d paired instances to restore", clientName, len(instances))
 
 	for _, instance := range instances {
 		w.loggerWrapper.GetLogger(clientName).LogInfo("[%s] Starting client for user '%s'", clientName, instance.Id)
@@ -2857,6 +2901,7 @@ func NewWhatsmeowService(
 		natsProducer:       natsProducer,
 		loggerWrapper:      loggerWrapper,
 		passkeyCeremony:    ceremony.NewStore(),
+		runtimeTokens:      make(map[string]string),
 	}
 }
 
