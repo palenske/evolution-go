@@ -316,21 +316,23 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 
 	var container *sqlstore.Container
 
+	var dbLog waLog.Logger
 	if w.config.WaDebug != "" {
-		dbLog := waLog.Stdout("Database", w.config.WaDebug, true)
-		if w.config.PostgresAuthDB != "" {
-			container, err = sqlstore.New(context.Background(), "postgres", w.config.PostgresAuthDB, dbLog)
-		} else {
-			dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
-			container, err = sqlstore.New(context.Background(), "sqlite", dsn, dbLog)
+		dbLog = waLog.Stdout("Database", w.config.WaDebug, true)
+	}
+
+	if w.config.PostgresAuthDB != "" {
+		// Reuse the existing bounded authDB pool instead of opening a new
+		// unbounded sql.DB per StartClient call (sqlstore.New leaks pools).
+		if w.authDB == nil {
+			w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] PostgresAuthDB configured but authDB pool is nil", cd.Instance.Id)
+			return
 		}
+		container = sqlstore.NewWithDB(w.authDB, "postgres", dbLog)
+		err = container.Upgrade(context.Background())
 	} else {
-		if w.config.PostgresAuthDB != "" {
-			container, err = sqlstore.New(context.Background(), "postgres", w.config.PostgresAuthDB, nil)
-		} else {
-			dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
-			container, err = sqlstore.New(context.Background(), "sqlite", dsn, nil)
-		}
+		dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
+		container, err = sqlstore.New(context.Background(), "sqlite", dsn, dbLog)
 	}
 
 	if err != nil {
@@ -1988,6 +1990,30 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 				mycli.loggerWrapper.GetLogger(instanceID).LogError("[%s] Failed to restart instance: %v", instanceID, err)
 			}
 		}(mycli.userID)
+	case *events.KeepAliveTimeout:
+		doWebhook = true
+		postMap["event"] = "KeepAliveTimeout"
+		mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn(
+			"[%s] KeepAlive timeout (errorCount=%d, lastSuccess=%v)",
+			mycli.userID, evt.ErrorCount, evt.LastSuccess,
+		)
+		postMap["data"] = map[string]interface{}{
+			"errorCount":  evt.ErrorCount,
+			"lastSuccess": evt.LastSuccess,
+		}
+		// After 3 consecutive timeouts, force a reconnect to recover zombie connections.
+		if evt.ErrorCount == 3 {
+			go func(instanceID string) {
+				mycli.loggerWrapper.GetLogger(instanceID).LogWarn("[%s] 3 consecutive keepalive timeouts, restarting instance to recover zombie connection", instanceID)
+				if err := mycli.service.ReconnectClient(instanceID); err != nil {
+					mycli.loggerWrapper.GetLogger(instanceID).LogError("[%s] Failed to restart instance after keepalive timeout: %v", instanceID, err)
+				}
+			}(mycli.userID)
+		}
+	case *events.KeepAliveRestored:
+		doWebhook = true
+		postMap["event"] = "KeepAliveRestored"
+		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] KeepAlive restored", mycli.userID)
 	case *events.LabelEdit:
 		doWebhook = true
 		postMap["event"] = "LabelEdit"
@@ -2222,7 +2248,7 @@ func (w *whatsmeowService) CallWebhook(instance *instance_model.Instance, queueN
 			w.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Event received of type %s", instance.Id, eventType)
 			w.sendToQueueOrWebhook(instance, queueName, jsonData)
 		}
-	case "Connected", "PairSuccess", "TemporaryBan", "LoggedOut", "ConnectFailure", "Disconnected":
+	case "Connected", "PairSuccess", "TemporaryBan", "LoggedOut", "ConnectFailure", "Disconnected", "KeepAliveTimeout", "KeepAliveRestored":
 		if contains(subscriptions, "CONNECTION") {
 			w.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Event received of type %s", instance.Id, eventType)
 			w.sendToQueueOrWebhook(instance, queueName, jsonData)
@@ -2510,7 +2536,7 @@ func (w *whatsmeowService) SendToGlobalQueues(eventType string, payload []byte, 
 				globalEventType = "CHAT_PRESENCE"
 			case "CallOffer", "CallAccept", "CallTerminate", "CallOfferNotice", "CallRelayLatency":
 				globalEventType = "CALL"
-			case "Connected", "PairSuccess", "TemporaryBan", "LoggedOut", "ConnectFailure", "Disconnected":
+			case "Connected", "PairSuccess", "TemporaryBan", "LoggedOut", "ConnectFailure", "Disconnected", "KeepAliveTimeout", "KeepAliveRestored":
 				globalEventType = "CONNECTION"
 			case "LabelEdit", "LabelAssociationChat", "LabelAssociationMessage":
 				globalEventType = "LABEL"
@@ -2572,7 +2598,7 @@ func (w *whatsmeowService) SendToGlobalQueues(eventType string, payload []byte, 
 			globalEventType = "CHAT_PRESENCE"
 		case "CallOffer", "CallAccept", "CallTerminate", "CallOfferNotice", "CallRelayLatency":
 			globalEventType = "CALL"
-		case "Connected", "PairSuccess", "TemporaryBan", "LoggedOut", "ConnectFailure", "Disconnected":
+		case "Connected", "PairSuccess", "TemporaryBan", "LoggedOut", "ConnectFailure", "Disconnected", "KeepAliveTimeout", "KeepAliveRestored":
 			globalEventType = "CONNECTION"
 		case "LabelEdit", "LabelAssociationChat", "LabelAssociationMessage":
 			globalEventType = "LABEL"
