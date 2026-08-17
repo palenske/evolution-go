@@ -4,7 +4,7 @@
   </a>
 </p>
 
-<h1 align="center">Evolution Go</h1>
+<h1 align="center">Evolution GoGo</h1>
 
 <p align="center">
   High-performance WhatsApp API built in Go — part of the Evolution Foundation ecosystem.
