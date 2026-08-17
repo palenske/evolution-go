@@ -176,6 +176,12 @@ type ProxyConfig struct {
 func (w whatsmeowService) ReconnectClient(instanceId string) error {
 	w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Starting reconnection process - simulating restart", instanceId)
 
+	// Release the runtime reservation held by the previous StartClient goroutine.
+	// Without this, the subsequent StartInstance→StartClient call would be blocked
+	// by reserveRuntime ("Runtime already active") because the old goroutine's
+	// defer release() hasn't run yet (it's stuck in the select loop).
+	w.releaseRuntime(instanceId)
+
 	// Passo 1: Limpar conexão existente se houver
 	if client, exists := w.clientPointer[instanceId]; exists {
 		w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Disconnecting existing client", instanceId)
@@ -323,6 +329,15 @@ func (w *whatsmeowService) reserveRuntime(instanceID string) (func(), bool) {
 			released = true
 		}
 	}, true
+}
+
+// releaseRuntime forcibly removes the runtime reservation for the given instance.
+// Used by ReconnectClient to unblock a subsequent StartClient call when the
+// previous runtime is still alive (its StartClient goroutine hasn't returned yet).
+func (w *whatsmeowService) releaseRuntime(instanceID string) {
+	w.runtimeMu.Lock()
+	defer w.runtimeMu.Unlock()
+	delete(w.runtimeTokens, instanceID)
 }
 
 func (w whatsmeowService) StartClient(cd *ClientData) {
