@@ -1,10 +1,42 @@
+# Environment
 .env
-logs/*
+
+# Logs
+logs/
+*.log
+
+# Build
 build/
-*.prof
+evolution-go
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test
+*.test
+*.out
 coverage.*
+
+# Profiling
+*.prof
+
+# Debug
+__debug_bin
+
+# Hot reload
 .air.toml
+
+# IDE
 .idea/
 .vscode/
+*.swp
+*.swo
+*~
+
+# OS
 .DS_Store
-evolution-go
+Thumbs.db
+
+# Temp
+tmp/
