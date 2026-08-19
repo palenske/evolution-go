@@ -83,7 +83,6 @@ type whatsmeowService struct {
 	labelRepository    label_repository.LabelRepository
 	pollService        poll_service.PollService // NOVO: Serviço de enquetes
 	config             *config.Config
-	killChannel        map[string](chan bool)
 	userInfoCache      *cache.Cache
 	registry           *ClientRegistry
 	rabbitmqProducer   producer_interfaces.Producer
@@ -96,9 +95,6 @@ type whatsmeowService struct {
 	natsProducer       producer_interfaces.Producer
 	loggerWrapper      *logger_wrapper.LoggerManager
 	passkeyCeremony    *ceremony.Store
-	runtimeTokens      map[string]string // instanceID -> token, prevents duplicate runtimes
-	runtimeMu          sync.Mutex        // guards runtimeTokens
-	reconnectLocks     sync.Map          // instanceID -> *sync.Mutex, singleflight for ReconnectClient
 }
 
 type MyClient struct {
@@ -118,7 +114,7 @@ type MyClient struct {
 	labelRepository    label_repository.LabelRepository
 	pollService        poll_service.PollService // NOVO: Serviço de enquetes
 	registry           *ClientRegistry
-	killChannel        map[string](chan bool)
+	runtimeCtx         context.Context // cancelado quando a runtime desta instancia morre
 	userInfoCache      *cache.Cache
 	config             *config.Config
 	historySyncID      int32
@@ -177,57 +173,24 @@ func (w *whatsmeowService) ReconnectClient(instanceId string) error {
 	// podem disparar reconexoes concorrentes para a mesma instancia. Só a primeira
 	// segue; as demais retornam nil ("reconexao ja encaminhada") e os chamadores
 	// caem no loop de espera que ja existe.
-	muAny, _ := w.reconnectLocks.LoadOrStore(instanceId, &sync.Mutex{})
-	mu := muAny.(*sync.Mutex)
-	if !mu.TryLock() {
+	release, ok := w.registry.TryReconnect(instanceId)
+	if !ok {
 		w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Reconnect already in progress, skipping", instanceId)
 		return nil
 	}
-	defer mu.Unlock()
+	defer release()
 
 	w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Starting reconnection process - simulating restart", instanceId)
 
-	// Release the runtime reservation held by the previous StartClient goroutine.
-	// Without this, the subsequent StartInstance→StartClient call would be blocked
-	// by reserveRuntime ("Runtime already active") because the old goroutine's
-	// defer release() hasn't run yet (it's stuck in the select loop).
-	w.releaseRuntime(instanceId)
-
-	// Passo 1: Limpar conexão existente se houver
-	if client := w.registry.GetClient(instanceId); client != nil {
-		w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Disconnecting existing client", instanceId)
-
-		// Desconectar o cliente WebSocket
-		if client.IsConnected() {
-			client.Disconnect()
-			w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] WebSocket disconnected", instanceId)
-		}
-
-		// Remover event handler se existir
-		if mycli, ok := w.registry.GetMyClient(instanceId); ok {
-			if mycli.eventHandlerID != 0 {
-				client.RemoveEventHandler(mycli.eventHandlerID)
-				w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Event handler removed", instanceId)
-			}
-		}
+	// Passo 1: derrubar a runtime anterior e ESPERAR ela morrer. A propria
+	// goroutine do StartClient faz o Disconnect e a limpeza do registry — nao
+	// duplicamos isso aqui. Se ela nao morrer a tempo, seguimos assim mesmo: o
+	// BeginRuntime do StartClient novo falha seguro ("Runtime already active").
+	if w.registry.KillAndWait(instanceId, 10*time.Second) {
+		w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Previous runtime stopped", instanceId)
+	} else {
+		w.loggerWrapper.GetLogger(instanceId).LogWarn("[%s] Previous runtime did not stop within 10s, proceeding anyway", instanceId)
 	}
-
-	// Passo 2: Limpar todos os recursos da instância
-	w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Cleaning up resources", instanceId)
-
-	// Enviar sinal de kill se o canal existir
-	if killChan, exists := w.killChannel[instanceId]; exists {
-		select {
-		case killChan <- true:
-			w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Kill signal sent", instanceId)
-		default:
-			// Canal pode estar bloqueado, continua
-		}
-	}
-
-	// Remover das estruturas
-	w.registry.DeleteInstance(instanceId)
-	delete(w.killChannel, instanceId)
 
 	// Limpar cache de userInfo para esta instância
 	if instance, err := w.instanceRepository.GetInstanceByID(instanceId); err == nil {
@@ -248,10 +211,8 @@ func (w *whatsmeowService) ReconnectClient(instanceId string) error {
 		w.loggerWrapper.GetLogger(instanceId).LogWarn("[%s] Failed to update disconnect status: %v", instanceId, err)
 	}
 
-	// Passo 4: Aguardar um pouco para garantir limpeza completa
-	time.Sleep(2 * time.Second)
-
-	// Passo 5: Iniciar nova instância como se fosse a primeira vez
+	// Passo 4: Iniciar nova instância como se fosse a primeira vez
+	// (sem sleep: o KillAndWait acima ja garantiu que a runtime antiga morreu)
 	w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Starting fresh instance", instanceId)
 	return w.StartInstance(instanceId)
 }
@@ -319,50 +280,21 @@ func (w *whatsmeowService) ForceUpdateJid(instanceId string, number string) erro
 	return nil
 }
 
-// reserveRuntime claims the right to run a client for the given instance.
-// Returns a release function and true if the reservation was acquired,
-// or nil and false if another runtime already holds the reservation.
-func (w *whatsmeowService) reserveRuntime(instanceID string) (func(), bool) {
-	w.runtimeMu.Lock()
-	defer w.runtimeMu.Unlock()
-	if _, held := w.runtimeTokens[instanceID]; held {
-		return nil, false
-	}
-	token := fmt.Sprintf("%s-%d", instanceID, time.Now().UnixNano())
-	w.runtimeTokens[instanceID] = token
-	released := false
-	return func() {
-		w.runtimeMu.Lock()
-		defer w.runtimeMu.Unlock()
-		if !released && w.runtimeTokens[instanceID] == token {
-			delete(w.runtimeTokens, instanceID)
-			released = true
-		}
-	}, true
-}
-
-// releaseRuntime forcibly removes the runtime reservation for the given instance.
-// Used by ReconnectClient to unblock a subsequent StartClient call when the
-// previous runtime is still alive (its StartClient goroutine hasn't returned yet).
-func (w *whatsmeowService) releaseRuntime(instanceID string) {
-	w.runtimeMu.Lock()
-	defer w.runtimeMu.Unlock()
-	delete(w.runtimeTokens, instanceID)
-}
-
 func (w *whatsmeowService) StartClient(cd *ClientData) {
 
 	w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("Starting websocket connection to Whatsapp for user '%s'", cd.Instance.Id)
 
 	// Prevent duplicate runtimes for the same instance. Without this guard,
 	// a QR request or reconnect can spawn a second client that shares the
-	// same killChannel and database row, causing the first to be torn down.
-	release, ok := w.reserveRuntime(cd.Instance.Id)
+	// same database row, causing the first to be torn down.
+	// A entrada em registry.runtimes E a reserva; finish() a libera e fecha o
+	// canal que ReconnectClient/instance_service esperam.
+	ctx, finish, ok := w.registry.BeginRuntime(cd.Instance.Id)
 	if !ok {
 		w.loggerWrapper.GetLogger(cd.Instance.Id).LogWarn("[%s] Runtime already active, skipping duplicate StartClient", cd.Instance.Id)
 		return
 	}
-	defer release()
+	defer finish()
 
 	var deviceStore *store.Device
 	var err error
@@ -544,7 +476,7 @@ func (w *whatsmeowService) StartClient(cd *ClientData) {
 		pollService:        w.pollService, // NOVO: Serviço de enquetes
 		userInfoCache:      w.userInfoCache,
 		registry:           w.registry,
-		killChannel:        w.killChannel,
+		runtimeCtx:         ctx,
 		config:             w.config,
 		historySyncID:      0,
 		rabbitmqProducer:   w.rabbitmqProducer,
@@ -633,66 +565,66 @@ func (w *whatsmeowService) StartClient(cd *ClientData) {
 
 	// Removed auto-reconnect logic to prevent infinite loops
 
-	for {
-		select {
-		case <-w.killChannel[cd.Instance.Id]:
-			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("Received kill signal for user '%s'", cd.Instance.Id)
-			client.Disconnect()
+	// Bloqueia ate alguem chamar registry.Kill(instanceId). Sem polling: antes
+	// isso era um select com default + sleep de 1s e, quando o canal de kill era
+	// removido do map, o case virava uma leitura de canal nil e a goroutine
+	// girava para sempre.
+	<-ctx.Done()
 
-			w.registry.DeleteInstance(cd.Instance.Id)
+	w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("Received kill signal for user '%s'", cd.Instance.Id)
+	client.Disconnect()
 
-			// Limpar cache de userInfo para esta instância
-			w.userInfoCache.Delete(cd.Instance.Token)
-			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] UserInfo cache cleared for token: %s", cd.Instance.Id, cd.Instance.Token)
+	w.registry.DeleteInstance(cd.Instance.Id)
 
-			cd.Instance.Connected = false
+	// Limpar cache de userInfo para esta instância
+	w.userInfoCache.Delete(cd.Instance.Token)
+	w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] UserInfo cache cleared for token: %s", cd.Instance.Id, cd.Instance.Token)
 
-			err := w.instanceRepository.UpdateConnected(cd.Instance.Id, cd.Instance.Connected, cd.Instance.DisconnectReason)
-			if err != nil {
-				w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Error updating instance: %s", cd.Instance.Id, err)
-			}
+	cd.Instance.Connected = false
 
-			postMap := make(map[string]interface{})
-
-			postMap["event"] = "LoggedOut"
-
-			dataMap := make(map[string]interface{})
-
-			dataMap["reason"] = "Logged out"
-
-			postMap["data"] = dataMap
-
-			postMap["instanceToken"] = mycli.token
-			postMap["instanceId"] = mycli.userID
-			postMap["instanceName"] = cd.Instance.Name
-
-			var queueName string
-
-			if _, ok := postMap["event"]; ok {
-				queueName = strings.ToLower(fmt.Sprintf("%s.%s", cd.Instance.Id, postMap["event"]))
-			}
-
-			values, err := json.Marshal(postMap)
-			if err != nil {
-				w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Failed to marshal JSON for queue", cd.Instance.Id)
-				return
-			}
-
-			go w.CallWebhook(cd.Instance, queueName, values)
-
-			if mycli.config.AmqpGlobalEnabled || mycli.config.NatsGlobalEnabled {
-				go mycli.service.SendToGlobalQueues(postMap["event"].(string), values, mycli.userID)
-			}
-
-			// Do NOT recursively call StartClient here — the runtime
-			// reservation is still held and would block. Reconnection is
-			// handled by the Disconnected event handler or by the caller.
-			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Kill handler cleanup done, not restarting from here", cd.Instance.Id)
-			return
-		default:
-			time.Sleep(1000 * time.Millisecond)
-		}
+	err = w.instanceRepository.UpdateConnected(cd.Instance.Id, cd.Instance.Connected, cd.Instance.DisconnectReason)
+	if err != nil {
+		w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Error updating instance: %s", cd.Instance.Id, err)
 	}
+
+	postMap := make(map[string]interface{})
+
+	postMap["event"] = "LoggedOut"
+
+	dataMap := make(map[string]interface{})
+
+	dataMap["reason"] = "Logged out"
+
+	postMap["data"] = dataMap
+
+	postMap["instanceToken"] = mycli.token
+	postMap["instanceId"] = mycli.userID
+	postMap["instanceName"] = cd.Instance.Name
+
+	var queueName string
+
+	if _, ok := postMap["event"]; ok {
+		queueName = strings.ToLower(fmt.Sprintf("%s.%s", cd.Instance.Id, postMap["event"]))
+	}
+
+	values, err := json.Marshal(postMap)
+	if err != nil {
+		w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Failed to marshal JSON for queue", cd.Instance.Id)
+		return
+	}
+
+	go w.CallWebhook(cd.Instance, queueName, values)
+
+	if mycli.config.AmqpGlobalEnabled || mycli.config.NatsGlobalEnabled {
+		go mycli.service.SendToGlobalQueues(postMap["event"].(string), values, mycli.userID)
+	}
+
+	// Do NOT recursively call StartClient here — the runtime
+	// reservation only frees when this goroutine returns (defer finish).
+	// Reconnection is handled by the Disconnected event handler or by
+	// the caller.
+	w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Kill handler cleanup done, not restarting from here", cd.Instance.Id)
+	return
 }
 
 func schedulePresenceUpdates(mycli *MyClient) {
@@ -715,9 +647,9 @@ func schedulePresenceUpdates(mycli *MyClient) {
 			randomInterval := time.Duration(1+rand.Intn(3)) * time.Hour
 			ticker = time.NewTicker(randomInterval)
 
-		case <-mycli.killChannel[mycli.userID]:
+		case <-mycli.runtimeCtx.Done():
 			mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Received kill signal, stopping presence updates", mycli.userID)
-			return // Encerra a goroutine quando receber sinal de kill
+			return // Encerra a goroutine quando a runtime da instancia morre
 		}
 	}
 }
@@ -904,13 +836,12 @@ func (mycli *MyClient) teardownQR(reason string, forceLogout bool) {
 		}
 	}
 
-	// Signal StartClient's select loop to disconnect and clean up the shared
-	// maps (it is the single writer for this instance). Blocking send mirrors
-	// the original timeout branch so the signal is never dropped.
-	mycli.loggerWrapper.GetLogger(instanceID).LogWarn("[%s] QR timeout — signaling kill channel", instanceID)
-	if killChan, exists := mycli.killChannel[instanceID]; exists {
-		killChan <- true
-	}
+	// Cancela a runtime: o StartClient desconecta e limpa o registry (ele e o
+	// dono unico dessa limpeza para a instancia). Kill nunca bloqueia — o send
+	// bloqueante anterior podia travar a goroutine de eventos do whatsmeow para
+	// sempre se ninguem estivesse lendo o canal.
+	mycli.loggerWrapper.GetLogger(instanceID).LogWarn("[%s] QR timeout — killing runtime", instanceID)
+	mycli.registry.Kill(instanceID)
 }
 
 func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
@@ -1959,8 +1890,10 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			}
 		}
 
-		// Agora mata o canal DEPOIS de enviar o evento
-		mycli.killChannel[mycli.userID] <- true
+		// Agora mata a runtime DEPOIS de enviar o evento.
+		// Kill nao bloqueia: o send bloqueante anterior podia travar esta
+		// goroutine (a de eventos do whatsmeow) permanentemente.
+		mycli.registry.Kill(mycli.userID)
 	case *events.ChatPresence:
 		doWebhook = true
 		postMap["event"] = "ChatPresence"
@@ -2469,8 +2402,6 @@ func (w *whatsmeowService) StartInstance(instanceId string) error {
 		}
 	}
 
-	w.killChannel[instance.Id] = make(chan bool)
-
 	clientData := &ClientData{
 		Instance:      instance,
 		Subscriptions: subscribedEvents,
@@ -2851,22 +2782,14 @@ func (w *whatsmeowService) ClearInstanceCache(instanceId string, token string) e
 	// Limpar userInfoCache
 	w.userInfoCache.Delete(token)
 
+	// Derrubar a runtime, se houver, e esperar ela terminar a propria limpeza
+	if !w.registry.KillAndWait(instanceId, 5*time.Second) {
+		w.loggerWrapper.GetLogger(instanceId).LogWarn("[%s] Runtime did not stop within 5s while clearing cache", instanceId)
+	}
+
 	// Limpar client e MyClient do registry (idempotente)
 	w.registry.DeleteInstance(instanceId)
 	w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Client and MyClient pointers cleared", instanceId)
-
-	// Limpar killChannel se existir
-	if killChan, exists := w.killChannel[instanceId]; exists {
-		select {
-		case killChan <- true:
-			// Canal recebeu o sinal
-		default:
-			// Canal pode estar bloqueado, apenas fecha
-		}
-		close(killChan)
-		delete(w.killChannel, instanceId)
-		w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Kill channel cleared", instanceId)
-	}
 
 	w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Instance cache completely cleared", instanceId)
 	return nil
@@ -2878,7 +2801,6 @@ func NewWhatsmeowService(
 	messageRepository message_repository.MessageRepository,
 	labelRepository label_repository.LabelRepository,
 	config *config.Config,
-	killChannel map[string](chan bool),
 	registry *ClientRegistry,
 	rabbitmqProducer producer_interfaces.Producer,
 	webhookProducer producer_interfaces.Producer,
@@ -2899,7 +2821,6 @@ func NewWhatsmeowService(
 		labelRepository:    labelRepository,
 		pollService:        pollSvc, // NOVO: Serviço de enquetes
 		config:             config,
-		killChannel:        killChannel,
 		userInfoCache:      cache.New(5*time.Minute, 10*time.Minute),
 		registry:           registry,
 		rabbitmqProducer:   rabbitmqProducer,
@@ -2912,7 +2833,6 @@ func NewWhatsmeowService(
 		natsProducer:       natsProducer,
 		loggerWrapper:      loggerWrapper,
 		passkeyCeremony:    ceremony.NewStore(),
-		runtimeTokens:      make(map[string]string),
 	}
 }
 

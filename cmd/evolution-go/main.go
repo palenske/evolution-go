@@ -82,7 +82,6 @@ func init() {
 }
 
 func setupRouter(db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.Config, conn *amqp.Connection, exPath string, runtimeCtx *core.RuntimeContext) *gin.Engine {
-	killChannel := make(map[string](chan bool))
 	registry := whatsmeow_service.NewClientRegistry()
 
 	loggerWrapper := logger_wrapper.NewLoggerManager(config)
@@ -167,7 +166,6 @@ func setupRouter(db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.C
 		message_repository.NewMessageRepository(db),
 		labelRepository,
 		config,
-		killChannel,
 		registry,
 		rabbitmqProducer,
 		webhookProducer,
@@ -180,7 +178,6 @@ func setupRouter(db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.C
 	)
 	instanceService := instance_service.NewInstanceService(
 		instanceRepository,
-		killChannel,
 		registry,
 		whatsmeowService,
 		config,

@@ -50,7 +50,6 @@ type InstanceService interface {
 type instances struct {
 	instanceRepository instance_repository.InstanceRepository
 	config             *config.Config
-	killChannel        map[string](chan bool)
 	registry           *whatsmeow_service.ClientRegistry
 	whatsmeowService   whatsmeow_service.WhatsmeowService
 	loggerWrapper      *logger_wrapper.LoggerManager
@@ -258,8 +257,6 @@ func (i instances) Connect(data *ConnectStruct, instance *instance_model.Instanc
 	if !isInstanceRunning {
 		i.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Starting new client instance", instance.Id)
 
-		i.killChannel[instance.Id] = make(chan bool)
-
 		clientData := &whatsmeow_service.ClientData{
 			Instance:      instance,
 			Subscriptions: subscribedEvents,
@@ -317,7 +314,11 @@ func (i instances) Disconnect(instance *instance_model.Instance) (*instance_mode
 	if client.IsConnected() {
 		if client.IsLoggedIn() {
 			i.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Disconnection successful", instance.Id)
-			i.killChannel[instance.Id] <- true
+			// Antes: send bloqueante num canal que podia nao ter leitor — travava
+			// o handler HTTP. Agora cancela a runtime e espera ela se limpar.
+			if !i.registry.KillAndWait(instance.Id, 5*time.Second) {
+				i.loggerWrapper.GetLogger(instance.Id).LogWarn("[%s] Runtime did not stop within 5s", instance.Id)
+			}
 
 			instance.Events = ""
 
@@ -352,13 +353,10 @@ func (i instances) Logout(instance *instance_model.Instance) (*instance_model.In
 			return instance, err
 		}
 
-		select {
-		case i.killChannel[instance.Id] <- true:
-		case <-time.After(5 * time.Second):
+		// A propria goroutine da runtime faz o Disconnect e limpa o registry.
+		if !i.registry.KillAndWait(instance.Id, 5*time.Second) {
+			i.loggerWrapper.GetLogger(instance.Id).LogWarn("[%s] Runtime did not stop within 5s", instance.Id)
 		}
-
-		i.registry.DeleteInstance(instance.Id)
-		delete(i.killChannel, instance.Id)
 
 		i.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Logout successful", instance.Id)
 		return instance, nil
@@ -367,13 +365,9 @@ func (i instances) Logout(instance *instance_model.Instance) (*instance_model.In
 	if client.IsConnected() {
 		client.Disconnect()
 
-		select {
-		case i.killChannel[instance.Id] <- true:
-		case <-time.After(5 * time.Second):
+		if !i.registry.KillAndWait(instance.Id, 5*time.Second) {
+			i.loggerWrapper.GetLogger(instance.Id).LogWarn("[%s] Runtime did not stop within 5s", instance.Id)
 		}
-
-		i.registry.DeleteInstance(instance.Id)
-		delete(i.killChannel, instance.Id)
 
 		i.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Disconnection successful", instance.Id)
 		return instance, nil
@@ -602,12 +596,13 @@ func (i instances) Delete(id string) error {
 		client.Disconnect()
 	}
 
-	// Limpar todos os recursos da instância antes de deletar
-	i.registry.DeleteInstance(instance.Id)
-	if i.killChannel[instance.Id] != nil {
-		close(i.killChannel[instance.Id])
-		delete(i.killChannel, instance.Id)
+	// Limpar todos os recursos da instância antes de deletar: derruba a runtime
+	// e espera ela terminar a propria limpeza (ClearInstanceCache logo abaixo
+	// cobre qualquer residuo).
+	if !i.registry.KillAndWait(instance.Id, 5*time.Second) {
+		i.loggerWrapper.GetLogger(instance.Id).LogWarn("[%s] Runtime did not stop within 5s during delete", instance.Id)
 	}
+	i.registry.DeleteInstance(instance.Id)
 
 	// Limpar cache via whatsmeow service
 	err = i.whatsmeowService.ClearInstanceCache(instance.Id, instance.Token)
@@ -721,8 +716,6 @@ func (i instances) ForceReconnect(instanceId string, number string) error {
 
 	subscribedEvents := strings.Split(instance.Events, ",")
 
-	i.killChannel[instance.Id] = make(chan bool)
-
 	clientData := &whatsmeow_service.ClientData{
 		Instance:      instance,
 		Subscriptions: subscribedEvents,
@@ -746,13 +739,10 @@ func (i instances) ForceReconnect(instanceId string, number string) error {
 	if client := i.registry.GetClient(instance.Id); client != nil {
 		client.Disconnect()
 
-		select {
-		case i.killChannel[instance.Id] <- true:
-		case <-time.After(5 * time.Second):
+		if !i.registry.KillAndWait(instance.Id, 5*time.Second) {
+			i.loggerWrapper.GetLogger(instance.Id).LogWarn("[%s] Runtime did not stop within 5s during force reconnect", instance.Id)
 		}
-
 		i.registry.DeleteInstance(instance.Id)
-		delete(i.killChannel, instance.Id)
 	}
 
 	go i.whatsmeowService.StartClient(clientData)
@@ -919,7 +909,6 @@ func (i instances) UpdateAdvancedSettings(instanceId string, settings *instance_
 
 func NewInstanceService(
 	instanceRepository instance_repository.InstanceRepository,
-	killChannel map[string](chan bool),
 	registry *whatsmeow_service.ClientRegistry,
 	whatsmeowService whatsmeow_service.WhatsmeowService,
 	config *config.Config,
@@ -927,7 +916,6 @@ func NewInstanceService(
 ) InstanceService {
 	return &instances{
 		instanceRepository: instanceRepository,
-		killChannel:        killChannel,
 		registry:           registry,
 		whatsmeowService:   whatsmeowService,
 		config:             config,
