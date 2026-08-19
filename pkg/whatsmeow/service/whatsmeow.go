@@ -2710,6 +2710,11 @@ func (w *whatsmeowService) UpdateInstanceSettings(instanceId string) error {
 		return fmt.Errorf("instance %s not found in runtime", instanceId)
 	}
 
+	// TODO(race): estes campos do MyClient sao escritos aqui (goroutine HTTP) e
+	// lidos pela goroutine de eventos do whatsmeow sem sincronizacao. Race
+	// distinta do registry, fora do escopo deste fix — resolver com um mutex no
+	// MyClient ou trocando o MyClient por um valor imutavel republicado no
+	// registry.
 	// Atualiza as configurações no MyClient em execução
 	myClient.Instance = instance
 	myClient.webhookUrl = instance.Webhook
@@ -2769,6 +2774,7 @@ func (w *whatsmeowService) UpdateInstanceAdvancedSettings(instanceId string) err
 		return fmt.Errorf("instance %s not found in runtime", instanceId)
 	}
 
+	// TODO(race): mesma escrita nao sincronizada de UpdateInstanceSettings.
 	// Atualiza a instância no MyClient com as advanced settings atualizadas
 	myClient.Instance = instance
 
