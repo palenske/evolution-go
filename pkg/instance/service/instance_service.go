@@ -736,14 +736,17 @@ func (i instances) ForceReconnect(instanceId string, number string) error {
 		}
 	}
 
-	if client := i.registry.GetClient(instance.Id); client != nil {
-		client.Disconnect()
-
+	// Nao chamar client.Disconnect() aqui: o evento Disconnected dispararia
+	// ReconnectClient numa goroutine concorrente, que pode criar uma nova
+	// runtime ANTES de DeleteInstance abaixo — e DeleteInstance deletaria a
+	// runtime nova em vez da antiga. KillAndWait cancela o ctx da runtime; a
+	// propria goroutine do StartClient faz Disconnect e limpa o registry.
+	if i.registry.HasRuntime(instance.Id) {
 		if !i.registry.KillAndWait(instance.Id, 5*time.Second) {
 			i.loggerWrapper.GetLogger(instance.Id).LogWarn("[%s] Runtime did not stop within 5s during force reconnect", instance.Id)
 		}
-		i.registry.DeleteInstance(instance.Id)
 	}
+	i.registry.DeleteInstance(instance.Id)
 
 	go i.whatsmeowService.StartClient(clientData)
 
