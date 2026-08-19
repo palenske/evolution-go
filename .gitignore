@@ -7,7 +7,7 @@ logs/
 
 # Build
 build/
-evolution-go
+/evolution-go
 *.exe
 *.dll
 *.so
