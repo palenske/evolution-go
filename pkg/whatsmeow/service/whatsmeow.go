@@ -99,6 +99,7 @@ type whatsmeowService struct {
 	passkeyCeremony    *ceremony.Store
 	runtimeTokens      map[string]string // instanceID -> token, prevents duplicate runtimes
 	runtimeMu          sync.Mutex        // guards runtimeTokens
+	reconnectLocks     sync.Map          // instanceID -> *sync.Mutex, singleflight for ReconnectClient
 }
 
 type MyClient struct {
@@ -174,6 +175,18 @@ type ProxyConfig struct {
 }
 
 func (w *whatsmeowService) ReconnectClient(instanceId string) error {
+	// Singleflight: eventos Disconnected/KeepAliveTimeout e o retry do send_service
+	// podem disparar reconexoes concorrentes para a mesma instancia. Só a primeira
+	// segue; as demais retornam nil ("reconexao ja encaminhada") e os chamadores
+	// caem no loop de espera que ja existe.
+	muAny, _ := w.reconnectLocks.LoadOrStore(instanceId, &sync.Mutex{})
+	mu := muAny.(*sync.Mutex)
+	if !mu.TryLock() {
+		w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Reconnect already in progress, skipping", instanceId)
+		return nil
+	}
+	defer mu.Unlock()
+
 	w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Starting reconnection process - simulating restart", instanceId)
 
 	// Release the runtime reservation held by the previous StartClient goroutine.
