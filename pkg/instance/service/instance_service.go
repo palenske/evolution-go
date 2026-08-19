@@ -51,7 +51,7 @@ type instances struct {
 	instanceRepository instance_repository.InstanceRepository
 	config             *config.Config
 	killChannel        map[string](chan bool)
-	clientPointer      map[string]*whatsmeow.Client
+	registry           *whatsmeow_service.ClientRegistry
 	whatsmeowService   whatsmeow_service.WhatsmeowService
 	loggerWrapper      *logger_wrapper.LoggerManager
 }
@@ -124,7 +124,7 @@ type ForceReconnectStruct struct {
 
 func (i *instances) ensureClientConnected(instanceId string) (*whatsmeow.Client, error) {
 	logger := i.loggerWrapper.GetLogger(instanceId)
-	client := i.clientPointer[instanceId]
+	client := i.registry.GetClient(instanceId)
 	logger.LogInfo("[%s] Checking client connection status - Client exists: %v", instanceId, client != nil)
 
 	if client == nil {
@@ -138,7 +138,7 @@ func (i *instances) ensureClientConnected(instanceId string) (*whatsmeow.Client,
 		logger.LogInfo("[%s] Instance started, waiting 2 seconds...", instanceId)
 		time.Sleep(2 * time.Second)
 
-		client = i.clientPointer[instanceId]
+		client = i.registry.GetClient(instanceId)
 		logger.LogInfo("[%s] Checking new client - Exists: %v, Connected: %v",
 			instanceId,
 			client != nil,
@@ -242,7 +242,7 @@ func (i instances) Connect(data *ConnectStruct, instance *instance_model.Instanc
 	}
 
 	// Verifica se a instância já está rodando
-	isInstanceRunning := i.clientPointer[instance.Id] != nil
+	isInstanceRunning := i.registry.GetClient(instance.Id) != nil
 
 	// Sincroniza as configurações na instância em execução (se já estiver conectada)
 	err = i.whatsmeowService.UpdateInstanceSettings(instance.Id)
@@ -288,8 +288,8 @@ func (i instances) Connect(data *ConnectStruct, instance *instance_model.Instanc
 	// logger.LogInfo("Waiting 1 seconds")
 	// time.Sleep(1000 * time.Millisecond)
 
-	// if i.clientPointer[instance.Id] != nil {
-	// 	if !i.clientPointer[instance.Id].IsConnected() {
+	// if client := i.registry.GetClient(instance.Id); client != nil {
+	// 	if !client.IsConnected() {
 	// 		return instance, "", "", fmt.Errorf("failed to connect")
 	// 	}
 	// } else {
@@ -357,7 +357,7 @@ func (i instances) Logout(instance *instance_model.Instance) (*instance_model.In
 		case <-time.After(5 * time.Second):
 		}
 
-		delete(i.clientPointer, instance.Id)
+		i.registry.DeleteInstance(instance.Id)
 		delete(i.killChannel, instance.Id)
 
 		i.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Logout successful", instance.Id)
@@ -372,7 +372,7 @@ func (i instances) Logout(instance *instance_model.Instance) (*instance_model.In
 		case <-time.After(5 * time.Second):
 		}
 
-		delete(i.clientPointer, instance.Id)
+		i.registry.DeleteInstance(instance.Id)
 		delete(i.killChannel, instance.Id)
 
 		i.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Disconnection successful", instance.Id)
@@ -384,7 +384,7 @@ func (i instances) Logout(instance *instance_model.Instance) (*instance_model.In
 }
 
 func (i instances) Status(instance *instance_model.Instance) (*StatusStruct, error) {
-	client := i.clientPointer[instance.Id]
+	client := i.registry.GetClient(instance.Id)
 
 	if client == nil {
 		return &StatusStruct{
@@ -413,7 +413,7 @@ func (i instances) Status(instance *instance_model.Instance) (*StatusStruct, err
 
 func (i instances) GetQr(instance *instance_model.Instance) (*QrcodeStruct, error) {
 	logger := i.loggerWrapper.GetLogger(instance.Id)
-	client := i.clientPointer[instance.Id]
+	client := i.registry.GetClient(instance.Id)
 
 	// If the client is already logged in, return immediately without
 	// calling StartInstance — otherwise polling GET /instance/qr would
@@ -443,7 +443,7 @@ func (i instances) GetQr(instance *instance_model.Instance) (*QrcodeStruct, erro
 		time.Sleep(3 * time.Second)
 
 		// Verificar novamente se há cliente
-		client = i.clientPointer[instance.Id]
+		client = i.registry.GetClient(instance.Id)
 		if client != nil && client.IsLoggedIn() {
 			return nil, fmt.Errorf("session already logged in")
 		}
@@ -519,7 +519,7 @@ func buildPasskeyOpenURL(token string) string {
 
 func (i instances) Pair(data *PairStruct, instance *instance_model.Instance) (*PairReturnStruct, error) {
 	logger := i.loggerWrapper.GetLogger(instance.Id)
-	client := i.clientPointer[instance.Id]
+	client := i.registry.GetClient(instance.Id)
 
 	if client == nil || !client.IsConnected() {
 		if client != nil && client.IsLoggedIn() {
@@ -533,7 +533,7 @@ func (i instances) Pair(data *PairStruct, instance *instance_model.Instance) (*P
 		// Wait for the WA websocket connection and initial QR generation to establish.
 		// PairPhone must be called after the QR event is received per whatsmeow docs.
 		time.Sleep(3 * time.Second)
-		client = i.clientPointer[instance.Id]
+		client = i.registry.GetClient(instance.Id)
 		if client == nil {
 			return nil, fmt.Errorf("failed to initialize client for pairing")
 		}
@@ -559,7 +559,7 @@ func (i instances) GetAll() ([]*instance_model.Instance, error) {
 	}
 
 	for _, instance := range instances {
-		if client := i.clientPointer[instance.Id]; client != nil {
+		if client := i.registry.GetClient(instance.Id); client != nil {
 			instance.Connected = client.IsLoggedIn()
 		} else {
 			instance.Connected = false
@@ -578,7 +578,7 @@ func (i instances) Info(instanceId string) (*instance_model.Instance, error) {
 	}
 
 	// Atualiza o status connected com base no estado real do cliente
-	if client := i.clientPointer[instance.Id]; client != nil {
+	if client := i.registry.GetClient(instance.Id); client != nil {
 		instance.Connected = client.IsLoggedIn()
 	} else {
 		instance.Connected = false
@@ -595,15 +595,15 @@ func (i instances) Delete(id string) error {
 		return err
 	}
 
-	if i.clientPointer[instance.Id] != nil && i.clientPointer[instance.Id].IsConnected() {
-		if i.clientPointer[instance.Id].IsLoggedIn() {
-			i.clientPointer[instance.Id].Logout(context.Background())
+	if client := i.registry.GetClient(instance.Id); client != nil && client.IsConnected() {
+		if client.IsLoggedIn() {
+			client.Logout(context.Background())
 		}
-		i.clientPointer[instance.Id].Disconnect()
+		client.Disconnect()
 	}
 
 	// Limpar todos os recursos da instância antes de deletar
-	delete(i.clientPointer, instance.Id)
+	i.registry.DeleteInstance(instance.Id)
 	if i.killChannel[instance.Id] != nil {
 		close(i.killChannel[instance.Id])
 		delete(i.killChannel, instance.Id)
@@ -705,7 +705,7 @@ func (i instances) RemoveProxy(id string) error {
 }
 
 func (i instances) ForceReconnect(instanceId string, number string) error {
-	if i.clientPointer[instanceId].IsConnected() && i.clientPointer[instanceId].IsLoggedIn() {
+	if client := i.registry.GetClient(instanceId); client != nil && client.IsConnected() && client.IsLoggedIn() {
 		return fmt.Errorf("client already connected")
 	}
 
@@ -743,8 +743,7 @@ func (i instances) ForceReconnect(instanceId string, number string) error {
 		}
 	}
 
-	if i.clientPointer[instance.Id] != nil {
-		client := i.clientPointer[instance.Id]
+	if client := i.registry.GetClient(instance.Id); client != nil {
 		client.Disconnect()
 
 		select {
@@ -752,7 +751,7 @@ func (i instances) ForceReconnect(instanceId string, number string) error {
 		case <-time.After(5 * time.Second):
 		}
 
-		delete(i.clientPointer, instance.Id)
+		i.registry.DeleteInstance(instance.Id)
 		delete(i.killChannel, instance.Id)
 	}
 
@@ -760,12 +759,12 @@ func (i instances) ForceReconnect(instanceId string, number string) error {
 
 	time.Sleep(2 * time.Second)
 
-	if i.clientPointer[instance.Id] != nil {
-		if !i.clientPointer[instance.Id].IsConnected() {
+	if client := i.registry.GetClient(instance.Id); client != nil {
+		if !client.IsConnected() {
 			return fmt.Errorf("failed to connect")
 		}
 
-		if !i.clientPointer[instance.Id].IsLoggedIn() {
+		if !client.IsLoggedIn() {
 			return fmt.Errorf("failed to login")
 		}
 	} else {
@@ -921,7 +920,7 @@ func (i instances) UpdateAdvancedSettings(instanceId string, settings *instance_
 func NewInstanceService(
 	instanceRepository instance_repository.InstanceRepository,
 	killChannel map[string](chan bool),
-	clientPointer map[string]*whatsmeow.Client,
+	registry *whatsmeow_service.ClientRegistry,
 	whatsmeowService whatsmeow_service.WhatsmeowService,
 	config *config.Config,
 	loggerWrapper *logger_wrapper.LoggerManager,
@@ -929,7 +928,7 @@ func NewInstanceService(
 	return &instances{
 		instanceRepository: instanceRepository,
 		killChannel:        killChannel,
-		clientPointer:      clientPointer,
+		registry:           registry,
 		whatsmeowService:   whatsmeowService,
 		config:             config,
 		loggerWrapper:      loggerWrapper,
