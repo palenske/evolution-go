@@ -298,7 +298,7 @@ func (i instances) Connect(data *ConnectStruct, instance *instance_model.Instanc
 
 func (i instances) Reconnect(instance *instance_model.Instance) error {
 	_, err := i.ensureClientConnected(instance.Id)
-	if err != nil {
+	if err != nil && err.Error() != "client disconnected" {
 		return err
 	}
 
