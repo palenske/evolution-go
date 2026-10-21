@@ -349,3 +349,38 @@ To contribute to the project:
 
 *Last updated: October 2025*
 
+
+## 0.7.3-hardening.1 (2026-10-20)
+
+Hardening do fork palenske para produção Powzz. Nenhum release upstream desde 0.7.2; fixes portados/adaptados dos PRs #190, #197 e issues #106/#185/#203.
+
+### Estabilidade de protocolo
+- Bump whatsmeow `20260630` → `20261017` (port do upstream #190): corrige loop de `stream:error` (~50min), morte permanente do client e offline queue que não drena (#185/#211). Requer Go 1.26.
+- Adaptações de API: `SetStatusMessage(types.SetStatusInput)`, `GetBlocklist`/`UpdateBlocklist(dhash)`.
+
+### Ciclo de vida (pool/orfãos)
+- Error paths do `StartClient` agora fazem `Disconnect` + `DeleteInstance` — client registrado antes do Connect não fica órfão no registry.
+- `ReconnectClient`: `KillAndWait` >10s **aborta** com erro em vez de prosseguir e deixar instância morta em silêncio.
+- Teardown de runtime emite `Disconnected`/`runtime_teardown` em vez de `LoggedOut`/`Logged out` — consumidores (Powzz) não marcam mais `needs_pairing` a cada reconnect de rotina.
+- `sqlstore.Upgrade` roda no máximo 1x/5min (não a cada StartClient).
+- Container SQLite cacheado por processo (mesmo leak do Postgres, no path não usado em prod).
+
+### Reconexão
+- Backoff exponencial por instância (5/15/30min) após reconexões consecutivas sem `Connected` — mitigação do QR storm (upstream #197). Zera no evento `Connected`.
+- `DeleteDevice` no Delete da instância — device não fica órfão em `whatsmeow_device`.
+- SQL injection no `ForceUpdateJid` corrigido (query parametrizada).
+
+### Recursos
+- Webhook producer: `http.Client` compartilhado com Timeout 15s, semáforo de 64 envios, retry com backoff exponencial.
+- `fetchWhatsAppWebVersion`: HTTP com timeout e fetch fora do lock global.
+- `schedulePresenceUpdates` inicia 1x por runtime (não por evento Connected).
+- Loop de QR observa `runtimeCtx` — sem goroutine zumbi pós-teardown.
+
+### Observabilidade
+- `/server/ok` real: ping authDB + stats do pool + goroutines; 503 se DB indisponível (Powzz aborta sweep).
+- `/metrics` (expvar): `evolution_reconnects_total`, `evolution_disconnected_events_total`, `evolution_webhook_failures_total`, `evolution_clients_registered`, `evolution_runtimes_active`.
+- `/instance/status` inclui `hasRuntime`.
+- Escritas de settings em `MyClient` protegidas por `settingsMu` (write-write race).
+
+### Migração
+- Consumidores do webhook que tratavam `LoggedOut` de teardown passam a ver `Disconnected` — o roteamento do Powzz já trata `Disconnected` como transitório, sem mudança de código.

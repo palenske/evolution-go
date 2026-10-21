@@ -31,6 +31,18 @@ type ClientRegistry struct {
 	// As entradas nunca sao removidas: o custo e desprezivel e deletar abriria
 	// corrida entre o delete e o TryLock de outra goroutine.
 	reconnect sync.Map // instanceID -> *sync.Mutex
+
+	// reconnectBackoff controla backoff exponencial por instancia para evitar
+	// QR storm: instancia logada-out que entra em loop de restart gera ~1135
+	// QRs em 50min (upstream #197). Entradas nunca sao removidas.
+	reconnectBackoff sync.Map // instanceID -> *reconnectBackoffState
+}
+
+// reconnectBackoffState guarda o estado de backoff de uma instancia.
+type reconnectBackoffState struct {
+	mu          sync.Mutex
+	failures    int       // restarts consecutivos desde o ultimo Connected
+	nextAllowed time.Time // ReconnectClient e ignorado antes disto
 }
 
 // instanceRuntime representa uma goroutine de runtime viva para uma instancia.
@@ -247,4 +259,59 @@ func (r *ClientRegistry) TryReconnect(instanceID string) (func(), bool) {
 		return nil, false
 	}
 	return mu.Unlock, true
+}
+
+// ---------------------------------------------------------------------------
+// Reconnect backoff
+// ---------------------------------------------------------------------------
+
+func (r *ClientRegistry) backoffFor(instanceID string) *reconnectBackoffState {
+	stAny, _ := r.reconnectBackoff.LoadOrStore(instanceID, &reconnectBackoffState{})
+	return stAny.(*reconnectBackoffState)
+}
+
+// ReconnectBackoffRemaining devolve quanto tempo ainda falta de backoff para a
+// instancia (0 se nao ha backoff ativo).
+func (r *ClientRegistry) ReconnectBackoffRemaining(instanceID string) time.Duration {
+	st := r.backoffFor(instanceID)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.nextAllowed.IsZero() {
+		return 0
+	}
+	d := time.Until(st.nextAllowed)
+	if d < 0 {
+		return 0
+	}
+	return d
+}
+
+// RegisterReconnectFailure incrementa o contador de falhas e agenda a proxima
+// tentativa com backoff exponencial: 5min, 15min, 30min (teto). Apos 5
+// falhas, o teto de 30min evita a espiral de QR/restart.
+func (r *ClientRegistry) RegisterReconnectFailure(instanceID string) {
+	st := r.backoffFor(instanceID)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.failures++
+	var delay time.Duration
+	switch {
+	case st.failures <= 2:
+		delay = 5 * time.Minute
+	case st.failures <= 4:
+		delay = 15 * time.Minute
+	default:
+		delay = 30 * time.Minute
+	}
+	st.nextAllowed = time.Now().Add(delay)
+}
+
+// ClearReconnectBackoff zera o backoff — chamado quando a instancia conecta
+// com sucesso (evento Connected).
+func (r *ClientRegistry) ClearReconnectBackoff(instanceID string) {
+	st := r.backoffFor(instanceID)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.failures = 0
+	st.nextAllowed = time.Time{}
 }

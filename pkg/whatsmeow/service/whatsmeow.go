@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/image/webp"
@@ -44,6 +45,7 @@ import (
 	logger_wrapper "github.com/evolution-foundation/evolution-go/pkg/logger"
 	message_model "github.com/evolution-foundation/evolution-go/pkg/message/model"
 	message_repository "github.com/evolution-foundation/evolution-go/pkg/message/repository"
+	"github.com/evolution-foundation/evolution-go/pkg/metrics"
 	"github.com/evolution-foundation/evolution-go/pkg/passkey/ceremony"
 	poll_service "github.com/evolution-foundation/evolution-go/pkg/poll/service"
 	storage_interfaces "github.com/evolution-foundation/evolution-go/pkg/storage/interfaces"
@@ -68,6 +70,10 @@ type WhatsmeowService interface {
 	PasskeyCeremonyStore() *ceremony.Store
 	SubmitPasskeyResponse(instanceId string, resp *types.WebAuthnResponse) error
 	ConfirmPasskey(instanceId string) error
+
+	// DeleteDevice remove a linha do device no authDB (whatsmeow_device).
+	// Chamado no Delete/Logout da instancia para nao deixar sessao orfa.
+	DeleteDevice(instanceId string) error
 }
 
 type clientVersion struct {
@@ -95,6 +101,17 @@ type whatsmeowService struct {
 	natsProducer       producer_interfaces.Producer
 	loggerWrapper      *logger_wrapper.LoggerManager
 	passkeyCeremony    *ceremony.Store
+
+	// pgUpgradeMu protege lastPgUpgrade: o Upgrade do sqlstore roda no maximo
+	// uma vez por intervalo (em vez de uma vez por StartClient/reconnect).
+	pgUpgradeMu   sync.Mutex
+	lastPgUpgrade time.Time
+
+	// sqliteContainerMu protege o cache unico de sqlstore.Container por
+	// processo no modo SQLite (sqlstore.New abre um *sql.DB novo por chamada
+	// e container.Close nunca e chamado — cada reconnect vazaria um pool).
+	sqliteContainerMu sync.Mutex
+	sqliteContainer   *sqlstore.Container
 }
 
 type MyClient struct {
@@ -127,6 +144,14 @@ type MyClient struct {
 	loggerWrapper      *logger_wrapper.LoggerManager
 	qrcodeCount        int
 	passkeyCeremony    *ceremony.Store
+	// presenceStarted garante que schedulePresenceUpdates rode uma unica vez
+	// por runtime, mesmo com multiplos eventos Connected/PushNameSetting.
+	presenceStarted atomic.Bool
+	// settingsMu protege Instance/webhookUrl/rabbitmqEnable/natsEnable/
+	// websocketEnable/subscriptions: escritos pela goroutine HTTP
+	// (UpdateInstanceSettings) e lidos pela goroutine de eventos do whatsmeow
+	// (TODO(race) original).
+	settingsMu sync.RWMutex
 }
 
 func (mycli *MyClient) persistMessageAsync(message message_model.Message) {
@@ -169,6 +194,15 @@ type ProxyConfig struct {
 }
 
 func (w *whatsmeowService) ReconnectClient(instanceId string) error {
+	// Backoff: instancia em espiral de restart (ex.: logada-out gerando QR
+	// infinito) nao deve ser reconectada imediatamente — upstream #197 mediu
+	// 1135 QRs em 50min sem isto. Zera no evento Connected.
+	if remaining := w.registry.ReconnectBackoffRemaining(instanceId); remaining > 0 {
+		w.loggerWrapper.GetLogger(instanceId).LogWarn("[%s] Reconnect backoff active, skipping — retry in %s", instanceId, remaining.Round(time.Second))
+		metrics.IncReconnect("backoff")
+		return fmt.Errorf("reconnect backoff active for %s (retry in %s)", instanceId, remaining.Round(time.Second))
+	}
+
 	// Singleflight: eventos Disconnected/KeepAliveTimeout e o retry do send_service
 	// podem disparar reconexoes concorrentes para a mesma instancia. Só a primeira
 	// segue; as demais retornam nil ("reconexao ja encaminhada") e os chamadores
@@ -180,17 +214,24 @@ func (w *whatsmeowService) ReconnectClient(instanceId string) error {
 	}
 	defer release()
 
+	// Conta a tentativa: se a instancia nao conectar (evento Connected limpa),
+	// a proxima chamada entra em backoff escalonado.
+	w.registry.RegisterReconnectFailure(instanceId)
+
 	w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Starting reconnection process - simulating restart", instanceId)
 
 	// Passo 1: derrubar a runtime anterior e ESPERAR ela morrer. A propria
 	// goroutine do StartClient faz o Disconnect e a limpeza do registry — nao
-	// duplicamos isso aqui. Se ela nao morrer a tempo, seguimos assim mesmo: o
-	// BeginRuntime do StartClient novo falha seguro ("Runtime already active").
-	if w.registry.KillAndWait(instanceId, 10*time.Second) {
-		w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Previous runtime stopped", instanceId)
-	} else {
-		w.loggerWrapper.GetLogger(instanceId).LogWarn("[%s] Previous runtime did not stop within 10s, proceeding anyway", instanceId)
+	// duplicamos isso aqui. Se ela nao morrer a tempo, ABORTAR: prosseguir
+	// faria o BeginRuntime do StartClient novo falhar ("Runtime already
+	// active") e deixaria a instancia morta em silencio, sem client e sem
+	// retry — o estado exato que o issue #185 descreve.
+	if !w.registry.KillAndWait(instanceId, 10*time.Second) {
+		w.loggerWrapper.GetLogger(instanceId).LogError("[%s] Previous runtime did not stop within 10s — reconnect aborted (will retry next cycle)", instanceId)
+		metrics.IncReconnect("kill_timeout")
+		return fmt.Errorf("previous runtime did not stop within 10s for instance %s", instanceId)
 	}
+	w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Previous runtime stopped", instanceId)
 
 	// Limpar cache de userInfo para esta instância
 	if instance, err := w.instanceRepository.GetInstanceByID(instanceId); err == nil {
@@ -214,6 +255,7 @@ func (w *whatsmeowService) ReconnectClient(instanceId string) error {
 	// Passo 4: Iniciar nova instância como se fosse a primeira vez
 	// (sem sleep: o KillAndWait acima ja garantiu que a runtime antiga morreu)
 	w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Starting fresh instance", instanceId)
+	metrics.IncReconnect("attempt")
 	return w.StartInstance(instanceId)
 }
 
@@ -225,8 +267,8 @@ func (w *whatsmeowService) ForceUpdateJid(instanceId string, number string) erro
 	}
 
 	if instance.Jid == "" && number != "" {
-		sqlDeviceSearch := fmt.Sprintf("SELECT jid FROM whatsmeow_device WHERE jid LIKE '%%%s%%'", number)
-		rows, err := w.authDB.Query(sqlDeviceSearch)
+		// Query parametrizada: number vem do body do /instance/forcereconnect.
+		rows, err := w.authDB.Query("SELECT jid FROM whatsmeow_device WHERE jid LIKE '%' || $1 || '%'", number)
 		if err != nil {
 			w.loggerWrapper.GetLogger(instanceId).LogError("[%s] Error getting device: %v", instanceId, err)
 			return err
@@ -318,10 +360,33 @@ func (w *whatsmeowService) StartClient(cd *ClientData) {
 			return
 		}
 		container = sqlstore.NewWithDB(w.authDB, "postgres", dbLog)
-		err = container.Upgrade(context.Background())
+		// Upgrade uma vez por intervalo, nao uma vez por StartClient: o metodo
+		// e idempotente mas custa uma ida ao DB a cada reconnect.
+		w.pgUpgradeMu.Lock()
+		if time.Since(w.lastPgUpgrade) > 5*time.Minute {
+			if uerr := container.Upgrade(context.Background()); uerr != nil {
+				w.loggerWrapper.GetLogger(cd.Instance.Id).LogWarn("[%s] sqlstore Upgrade failed (will retry next start): %v", cd.Instance.Id, uerr)
+			} else {
+				w.lastPgUpgrade = time.Now()
+			}
+		}
+		w.pgUpgradeMu.Unlock()
 	} else {
-		dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
-		container, err = sqlstore.New(context.Background(), "sqlite", dsn, dbLog)
+		// SQLite: um unico container por processo. sqlstore.New abre um
+		// *sql.DB novo (pool + goroutine connectionOpener) por chamada e
+		// container.Close nunca e chamado — cada reconnect vazaria um pool.
+		w.sqliteContainerMu.Lock()
+		if w.sqliteContainer == nil {
+			dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
+			w.sqliteContainer, err = sqlstore.New(context.Background(), "sqlite", dsn, dbLog)
+			if err != nil {
+				w.sqliteContainerMu.Unlock()
+				w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Failed to create sqlite container: %v", cd.Instance.Id, err)
+				return
+			}
+		}
+		container = w.sqliteContainer
+		w.sqliteContainerMu.Unlock()
 	}
 
 	if err != nil {
@@ -404,6 +469,20 @@ func (w *whatsmeowService) StartClient(cd *ClientData) {
 	client := whatsmeow.NewClient(deviceStore, clientLog)
 
 	w.registry.SetClient(cd.Instance.Id, client)
+
+	// Cleanup em caso de retorno precoce apos o registro no registry: sem
+	// isto, um Connect que falha deixa um client (e possivelmente um socket
+	// meio-aberto) orfao no mapa — o proximo StartClient sobrescreve a
+	// entrada sem nunca chamar Disconnect no client antigo.
+	// O caminho normal (bloqueio em ctx.Done + teardown) limpa o flag.
+	startFailed := true
+	defer func() {
+		if startFailed {
+			w.loggerWrapper.GetLogger(cd.Instance.Id).LogWarn("[%s] StartClient failed after client registration — cleaning up orphan client", cd.Instance.Id)
+			client.Disconnect()
+			w.registry.DeleteInstance(cd.Instance.Id)
+		}
+	}()
 
 	if cd.IsProxy {
 		var proxyConfig ProxyConfig
@@ -565,6 +644,10 @@ func (w *whatsmeowService) StartClient(cd *ClientData) {
 
 	// Removed auto-reconnect logic to prevent infinite loops
 
+	// A partir daqui a runtime esta "viva": o teardown normal (kill) assume a
+	// responsabilidade pela limpeza do registry e do client.
+	startFailed = false
+
 	// Bloqueia ate alguem chamar registry.Kill(instanceId). Sem polling: antes
 	// isso era um select com default + sleep de 1s e, quando o canal de kill era
 	// removido do map, o case virava uma leitura de canal nil e a goroutine
@@ -587,13 +670,17 @@ func (w *whatsmeowService) StartClient(cd *ClientData) {
 		w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Error updating instance: %s", cd.Instance.Id, err)
 	}
 
+	// Teardown de runtime NAO e logout do WhatsApp: emite Disconnected com
+	// reason "runtime_teardown" para que consumidores (ex.: Powzz) tratem como
+	// transitório. Emitir LoggedOut aqui faz o Powzz marcar needs_pairing por
+	// 24h apos cada reconnect de rotina do cron.
 	postMap := make(map[string]interface{})
 
-	postMap["event"] = "LoggedOut"
+	postMap["event"] = "Disconnected"
 
 	dataMap := make(map[string]interface{})
 
-	dataMap["reason"] = "Logged out"
+	dataMap["reason"] = "runtime_teardown"
 
 	postMap["data"] = dataMap
 
@@ -771,11 +858,19 @@ func (mycli *MyClient) handleQRCodes(codes []string) {
 			}
 
 			// Rotation timing: first code lives ~60s, subsequent ~20s (whatsmeow native).
+			// Observa runtimeCtx: se a runtime for morta (Kill/reconnect/logout)
+			// durante o sleep, esta goroutine nao pode continuar fazendo UpdateQrcode
+			// e webhooks QR sobre um client ja desconectado (zumbi de ate ~3,5min).
 			timeout := 20 * time.Second
 			if i == 0 {
 				timeout = 60 * time.Second
 			}
-			time.Sleep(timeout)
+			select {
+			case <-mycli.runtimeCtx.Done():
+				mycli.loggerWrapper.GetLogger(instanceID).LogInfo("[%s] Runtime killed during QR rotation — stopping QR loop", instanceID)
+				return
+			case <-time.After(timeout):
+			}
 		}
 
 		// Ran out of codes without a PairSuccess. Treat as QR timeout (mirrors
@@ -867,6 +962,8 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		}
 	case *events.Connected, *events.PushNameSetting:
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] events.Connected to Whatsapp for user '%s'", mycli.userID, mycli.WAClient.Store.PushName)
+		// Conexao bem-sucedida: zera o backoff de reconnect desta instancia.
+		mycli.registry.ClearReconnectBackoff(mycli.userID)
 		if len(mycli.WAClient.Store.PushName) > 0 {
 			doWebhook = true
 			postMap["event"] = "Connected"
@@ -917,7 +1014,12 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			// the user's phone. When alwaysOnline is false we now send Unavailable instead.
 			var err error
 			if mycli.Instance.AlwaysOnline {
-				go schedulePresenceUpdates(mycli)
+				// Uma unica goroutine de presence por runtime: Connected/PushNameSetting
+				// pode disparar varias vezes no mesmo client (flaps), e cada `go`
+				// acumularia um ticker de 1-3h até o kill da runtime.
+				if mycli.presenceStarted.CompareAndSwap(false, true) {
+					go schedulePresenceUpdates(mycli)
+				}
 
 				err = mycli.WAClient.SendPresence(context.Background(), types.PresenceAvailable)
 				if err != nil {
@@ -1965,6 +2067,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 	case *events.Disconnected:
 		doWebhook = true
 		postMap["event"] = "Disconnected"
+		metrics.IncDisconnected()
 
 		// Limpar cache de userInfo para esta instância (mas não para reconexão automática)
 		mycli.userInfoCache.Delete(mycli.Instance.Token)
@@ -1987,6 +2090,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 	case *events.KeepAliveTimeout:
 		doWebhook = true
 		postMap["event"] = "KeepAliveTimeout"
+		metrics.IncDisconnected()
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn(
 			"[%s] KeepAlive timeout (errorCount=%d, lastSuccess=%v)",
 			mycli.userID, evt.ErrorCount, evt.LastSuccess,
@@ -2629,17 +2733,22 @@ var (
 	cachedWebVersionAt time.Time
 	cachedWebVersionMu sync.Mutex
 	webVersionCacheTTL = 1 * time.Hour
+	// webVersionHTTPClient: timeout obrigatorio — fetchWhatsAppWebVersion segura
+	// um mutex global; um http.Get sem timeout que pendurasse bloquearia todo
+	// StartClient que precisasse da versao.
+	webVersionHTTPClient = &http.Client{Timeout: 10 * time.Second}
 )
 
 func fetchWhatsAppWebVersion() (*clientVersion, error) {
 	cachedWebVersionMu.Lock()
-	defer cachedWebVersionMu.Unlock()
-
 	if cachedWebVersion != nil && time.Since(cachedWebVersionAt) < webVersionCacheTTL {
+		defer cachedWebVersionMu.Unlock()
 		return cachedWebVersion, nil
 	}
+	cachedWebVersionMu.Unlock()
 
-	resp, err := http.Get("https://web.whatsapp.com/sw.js")
+	// Fetch FORA do lock: o mutex protege o cache, nao a rede.
+	resp, err := webVersionHTTPClient.Get("https://web.whatsapp.com/sw.js")
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch WhatsApp Web version: %v", err)
 	}
@@ -2672,12 +2781,14 @@ func fetchWhatsAppWebVersion() (*clientVersion, error) {
 
 			// Log qual padrão funcionou
 			if clientRevision > 0 {
+				cachedWebVersionMu.Lock()
 				cachedWebVersion = &clientVersion{
 					Major: 2,
 					Minor: 3000,
 					Patch: clientRevision,
 				}
 				cachedWebVersionAt = time.Now()
+				cachedWebVersionMu.Unlock()
 				return cachedWebVersion, nil
 			}
 		}
@@ -2710,12 +2821,9 @@ func (w *whatsmeowService) UpdateInstanceSettings(instanceId string) error {
 		return fmt.Errorf("instance %s not found in runtime", instanceId)
 	}
 
-	// TODO(race): estes campos do MyClient sao escritos aqui (goroutine HTTP) e
-	// lidos pela goroutine de eventos do whatsmeow sem sincronizacao. Race
-	// distinta do registry, fora do escopo deste fix — resolver com um mutex no
-	// MyClient ou trocando o MyClient por um valor imutavel republicado no
-	// registry.
-	// Atualiza as configurações no MyClient em execução
+	// Campos protegidos por settingsMu: escritos aqui (goroutine HTTP) e lidos
+	// pela goroutine de eventos do whatsmeow.
+	myClient.settingsMu.Lock()
 	myClient.Instance = instance
 	myClient.webhookUrl = instance.Webhook
 	myClient.rabbitmqEnable = instance.RabbitmqEnable
@@ -2741,6 +2849,7 @@ func (w *whatsmeowService) UpdateInstanceSettings(instanceId string) error {
 	}
 
 	myClient.subscriptions = subscribedEvents
+	myClient.settingsMu.Unlock()
 
 	// Atualiza o cache do userInfo com as novas configurações
 	v := Values{map[string]string{
@@ -2774,11 +2883,53 @@ func (w *whatsmeowService) UpdateInstanceAdvancedSettings(instanceId string) err
 		return fmt.Errorf("instance %s not found in runtime", instanceId)
 	}
 
-	// TODO(race): mesma escrita nao sincronizada de UpdateInstanceSettings.
-	// Atualiza a instância no MyClient com as advanced settings atualizadas
+	// Escrita serializada por settingsMu (mesmo lock de UpdateInstanceSettings).
+	myClient.settingsMu.Lock()
 	myClient.Instance = instance
+	myClient.settingsMu.Unlock()
 
 	w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Advanced settings updated in runtime successfully", instanceId)
+	return nil
+}
+
+// DeleteDevice remove a linha do device no authDB. Chamado no Delete/Logout
+// da instancia para nao deixar sessao orfa em whatsmeow_device — sem isto, o
+// device fica para sempre e o pool authDB so cresce.
+func (w *whatsmeowService) DeleteDevice(instanceId string) error {
+	if w.config.PostgresAuthDB == "" {
+		// SQLite: o container compartilhado tambem expoe DeleteDevice, mas o
+		// modo produtivo do Powzz e Postgres; no SQLite o device vive no file.
+		return nil
+	}
+
+	instance, err := w.instanceRepository.GetInstanceByID(instanceId)
+	if err != nil {
+		return fmt.Errorf("get instance for DeleteDevice: %w", err)
+	}
+	if instance.Jid == "" {
+		w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] DeleteDevice: no JID on instance, nothing to delete", instanceId)
+		return nil
+	}
+
+	jid, ok := utils.ParseJID(instance.Jid)
+	if !ok {
+		return fmt.Errorf("DeleteDevice: invalid JID %q", instance.Jid)
+	}
+
+	container := sqlstore.NewWithDB(w.authDB, "postgres", nil)
+	dev, err := container.GetDevice(context.Background(), jid)
+	if err != nil {
+		return fmt.Errorf("DeleteDevice: get device: %w", err)
+	}
+	if dev == nil || dev.ID == nil {
+		w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] DeleteDevice: no device row for %s", instanceId, instance.Jid)
+		return nil
+	}
+
+	if err := container.DeleteDevice(context.Background(), dev); err != nil {
+		return fmt.Errorf("DeleteDevice: delete: %w", err)
+	}
+	w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] DeleteDevice: removed device row for %s", instanceId, instance.Jid)
 	return nil
 }
 

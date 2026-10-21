@@ -76,6 +76,7 @@ func (r *Routes) AssignRoutes(eng *gin.Engine) {
 	})
 
 	eng.GET("/server/ok", r.serverHandler.ServerOk)
+	eng.GET("/metrics", r.serverHandler.Metrics)
 
 	routes := eng.Group("/instance")
 	{
