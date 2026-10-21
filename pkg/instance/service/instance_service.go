@@ -82,10 +82,11 @@ type ConnectStruct struct {
 }
 
 type StatusStruct struct {
-	Connected bool
-	LoggedIn  bool
-	myJid     *types.JID
-	Name      string
+	Connected  bool
+	LoggedIn   bool
+	HasRuntime bool
+	myJid      *types.JID
+	Name       string
 }
 
 type QrcodeStruct struct {
@@ -379,11 +380,13 @@ func (i instances) Logout(instance *instance_model.Instance) (*instance_model.In
 
 func (i instances) Status(instance *instance_model.Instance) (*StatusStruct, error) {
 	client := i.registry.GetClient(instance.Id)
+	hasRuntime := i.registry.HasRuntime(instance.Id)
 
 	if client == nil {
 		return &StatusStruct{
-			Connected: false,
-			LoggedIn:  false,
+			Connected:  false,
+			LoggedIn:   false,
+			HasRuntime: hasRuntime,
 		}, nil
 	}
 
@@ -398,10 +401,11 @@ func (i instances) Status(instance *instance_model.Instance) (*StatusStruct, err
 	}
 
 	return &StatusStruct{
-		Connected: isConnected,
-		LoggedIn:  isLoggedIn,
-		myJid:     myJid,
-		Name:      name,
+		Connected:  isConnected,
+		LoggedIn:   isLoggedIn,
+		HasRuntime: hasRuntime,
+		myJid:      myJid,
+		Name:       name,
 	}, nil
 }
 
@@ -603,6 +607,12 @@ func (i instances) Delete(id string) error {
 		i.loggerWrapper.GetLogger(instance.Id).LogWarn("[%s] Runtime did not stop within 5s during delete", instance.Id)
 	}
 	i.registry.DeleteInstance(instance.Id)
+
+	// Remover a linha do device no authDB — sem isto a sessao fica orfa para
+	// sempre em whatsmeow_device.
+	if err := i.whatsmeowService.DeleteDevice(instance.Id); err != nil {
+		i.loggerWrapper.GetLogger(instance.Id).LogWarn("[%s] Failed to delete device row: %v", instance.Id, err)
+	}
 
 	// Limpar cache via whatsmeow service
 	err = i.whatsmeowService.ClearInstanceCache(instance.Id, instance.Token)

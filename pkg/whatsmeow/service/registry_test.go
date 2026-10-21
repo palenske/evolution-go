@@ -344,3 +344,42 @@ func TestRuntimeUnicaSobReconexoesConcorrentes(t *testing.T) {
 		t.Fatal("sobrou runtime viva apos o Kill final — runtime duplicada")
 	}
 }
+
+func TestReconnectBackoff(t *testing.T) {
+	r := NewClientRegistry()
+
+	// Sem backoff inicial.
+	if d := r.ReconnectBackoffRemaining("a"); d != 0 {
+		t.Fatalf("ReconnectBackoffRemaining inicial = %v, quer 0", d)
+	}
+
+	// Primeira falha: backoff de ~5min.
+	r.RegisterReconnectFailure("a")
+	d := r.ReconnectBackoffRemaining("a")
+	if d <= 4*time.Minute || d > 5*time.Minute {
+		t.Fatalf("apos 1a falha, remaining = %v, quer ~5min", d)
+	}
+
+	// Segunda falha ainda ~5min.
+	r.RegisterReconnectFailure("a")
+	if d := r.ReconnectBackoffRemaining("a"); d <= 4*time.Minute || d > 5*time.Minute {
+		t.Fatalf("apos 2a falha, remaining = %v, quer ~5min", d)
+	}
+
+	// Terceira falha escala para ~15min.
+	r.RegisterReconnectFailure("a")
+	if d := r.ReconnectBackoffRemaining("a"); d <= 14*time.Minute || d > 15*time.Minute {
+		t.Fatalf("apos 3a falha, remaining = %v, quer ~15min", d)
+	}
+
+	// Connected zera o backoff.
+	r.ClearReconnectBackoff("a")
+	if d := r.ReconnectBackoffRemaining("a"); d != 0 {
+		t.Fatalf("apos ClearReconnectBackoff, remaining = %v, quer 0", d)
+	}
+
+	// Instancia "b" nao e afetada pelo backoff de "a".
+	if d := r.ReconnectBackoffRemaining("b"); d != 0 {
+		t.Fatalf("backoff vazou para outra instancia: remaining = %v", d)
+	}
+}
