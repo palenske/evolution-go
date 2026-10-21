@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"go.mau.fi/whatsmeow"
+
+	"github.com/evolution-foundation/evolution-go/pkg/metrics"
 )
 
 // ClientRegistry e o dono unico do estado por instancia que antes vivia em tres
@@ -85,8 +87,10 @@ func (r *ClientRegistry) LookupClient(instanceID string) (*whatsmeow.Client, boo
 
 func (r *ClientRegistry) SetClient(instanceID string, client *whatsmeow.Client) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.clients[instanceID] = client
+	n := len(r.clients)
+	r.mu.Unlock()
+	metrics.SetClientsRegistered(n)
 }
 
 // GetMyClient devolve o MyClient da instancia.
@@ -107,9 +111,11 @@ func (r *ClientRegistry) SetMyClient(instanceID string, mycli *MyClient) {
 // Nao mexe na runtime: quem encerra runtime e Kill/finish.
 func (r *ClientRegistry) DeleteInstance(instanceID string) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	delete(r.clients, instanceID)
 	delete(r.myClients, instanceID)
+	n := len(r.clients)
+	r.mu.Unlock()
+	metrics.SetClientsRegistered(n)
 }
 
 // CountClients devolve quantos clients estao registrados.
@@ -164,6 +170,7 @@ func (r *ClientRegistry) BeginRuntime(instanceID string) (context.Context, func(
 	ctx, cancel := context.WithCancel(context.Background())
 	rt := &instanceRuntime{ctx: ctx, cancel: cancel, done: make(chan struct{})}
 	r.runtimes[instanceID] = rt
+	metrics.SetRuntimesActive(len(r.runtimes))
 
 	finish := func() {
 		rt.once.Do(func() {
@@ -171,7 +178,9 @@ func (r *ClientRegistry) BeginRuntime(instanceID string) (context.Context, func(
 			if cur, ok := r.runtimes[instanceID]; ok && cur == rt {
 				delete(r.runtimes, instanceID)
 			}
+			n := len(r.runtimes)
 			r.mu.Unlock()
+			metrics.SetRuntimesActive(n)
 			cancel()
 			close(rt.done)
 		})
